@@ -7,9 +7,9 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 
-from monopi.serl.serl.common.common import default_init
-from monopi.serl.serl.networks.mlp import MLP
-from monopi.serl.serl.utils.jax_utils import next_rng
+from serl_launcher.common.common import default_init
+from serl_launcher.networks.mlp import MLP
+from serl_launcher.utils.jax_utils import next_rng
 
 
 class ValueCritic(nn.Module):

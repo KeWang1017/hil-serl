@@ -9,6 +9,8 @@ import requests
 from scipy.spatial.transform import Rotation as R
 from franka_env.envs.franka_env import FrankaEnv
 from typing import List
+import inputs
+import threading
 
 sigmoid = lambda x: 1 / (1 + np.exp(-x))
 
@@ -202,7 +204,6 @@ class GripperCloseEnv(gym.ActionWrapper):
     
     def reset(self, **kwargs):
         return self.env.reset(**kwargs)
-
     
 class SpacemouseIntervention(gym.ActionWrapper):
     def __init__(self, env, action_indices=None):
@@ -396,3 +397,188 @@ class DualGripperPenaltyWrapper(gym.RewardWrapper):
             action = info["intervene_action"]
         reward = self.reward(reward, action)
         return observation, reward, terminated, truncated, info
+
+class JoystickIntervention(gym.ActionWrapper):
+    def __init__(self, env, action_indices=None):
+        super().__init__(env)
+        
+        self.gripper_enabled = True
+        if self.action_space.shape == (6,):
+            self.gripper_enabled = False
+        # we can set action_indices to choose which action to intervene on
+        # e.g. action_indices=[0, 1, 2] will only intervene on the position control
+        self.action_indices = action_indices 
+        
+        # Controller state
+        self.x_axis = 0
+        self.y_axis = 0
+        self.z_axis = 0
+        self.rx_axis = 0
+        self.ry_axis = 0
+        self.rz_axis = 0
+        self.left = False   # Left bumper for close gripper
+        self.right = False  # Right bumper for open gripper
+        
+        # Start controller reading thread
+        self.running = True
+        self.thread = threading.Thread(target=self._read_gamepad)
+        self.thread.daemon = True
+        self.thread.start()
+    
+    def _reset_cmds(self):
+        self.x_axis = 0
+        self.y_axis = 0
+        self.z_axis = 0
+        self.rx_axis = 0
+        self.ry_axis = 0
+        self.rz_axis = 0
+
+    def _read_gamepad(self):
+        useful_codes = ['ABS_X', 'ABS_Y', 'ABS_RX', 'ABS_RY', 'ABS_Z', 'ABS_RZ', 'ABS_HAT0X']
+        
+        # Store consecutive event counters and values
+        event_counter = {
+            'ABS_X': 0,
+            'ABS_Y': 0,
+            'ABS_RX': 0,
+            'ABS_RY': 0,
+            'ABS_Z': 0,
+            'ABS_RZ': 0,
+            'ABS_HAT0X': 0,
+        }
+        
+        # Scale factors for different axes
+        scale = {
+            'ABS_X': 0.1,    # Adjust these scale factors
+            'ABS_Y': 0.1,    # to control sensitivity
+            'ABS_RX': 0.3,
+            'ABS_RY': 0.3,
+            'ABS_Z': 0.04,
+            'ABS_RZ': 0.04,
+            'ABS_HAT0X': 0.3,
+        }
+
+        while self.running:
+            try:
+                # Get fresh events
+                events = inputs.get_gamepad()
+                latest_events = {}
+                for event in events:
+                    latest_events[event.code] = event.state                
+                # Process events
+                for code in useful_codes:
+                    if code in latest_events:
+                        event_counter[code] += 1
+                        current_value = latest_events[code]
+                                            
+                    # Only update if we've seen the same value 3 times
+                    if event_counter[code] >= 1:
+                        # Calculate relative changes based on the axis
+                        if code == 'ABS_Y':
+                            new_value = current_value / 32768.0
+                            self.x_axis = -new_value * scale[code]
+                            
+                        elif code == 'ABS_X':
+                            new_value = current_value / 32768.0
+                            self.y_axis = -new_value * scale[code]
+                            
+                        elif code == 'ABS_RZ':
+                            new_value = current_value / 255.0
+                            self.z_axis = new_value * scale[code]
+                            
+                        elif code == 'ABS_Z':
+                            new_value = current_value / 255.0
+                            self.z_axis = -new_value * scale[code]
+                            
+                        elif code == 'ABS_RX':
+                            new_value = current_value / 32768.0
+                            self.rx_axis = new_value * scale[code]
+                            
+                        elif code == 'ABS_RY':
+                            new_value = current_value / 32768.0
+                            self.ry_axis = new_value * scale[code]
+                            
+                        elif code == 'ABS_HAT0X':
+                            new_value = current_value / 1.0
+                            self.rz_axis = new_value * scale[code]
+                        # Reset counter after update
+                        event_counter[code] = 0
+                        # print("cmd", code, self.x_axis, self.y_axis, self.z_axis, self.rx_axis, self.ry_axis, self.rz_axis)
+                
+                # Handle button events immediately
+                if 'BTN_TL' in latest_events:
+                    self.left = bool(latest_events['BTN_TL'])
+                    self._reset_cmds()
+                if 'BTN_TR' in latest_events:
+                    self.right = bool(latest_events['BTN_TR'])
+                    self._reset_cmds()
+                
+            except inputs.UnpluggedError:
+                print("No controller found. Retrying...")
+                time.sleep(1)
+
+    def action(self, action):
+        """
+        Input:
+        - action: policy action
+        Output:
+        - action: joystick action if nonzero; else, policy action
+        """
+        # Get joystick action
+        deadzone = 0.03
+        expert_a = np.zeros(6)
+        
+        # Apply deadzone to position control
+        expert_a[0] = self.x_axis if abs(self.x_axis) > deadzone else 0
+        expert_a[1] = self.y_axis if abs(self.y_axis) > deadzone else 0
+        expert_a[2] = self.z_axis if abs(self.z_axis) > deadzone else 0
+        
+        # Apply deadzone to rotation control
+        expert_a[3] = self.rx_axis if abs(self.rx_axis) > deadzone else 0
+        expert_a[4] = self.ry_axis if abs(self.ry_axis) > deadzone else 0
+        expert_a[5] = self.rz_axis if abs(self.rz_axis) > deadzone else 0
+        self._reset_cmds()
+        
+        intervened = False
+        if np.linalg.norm(expert_a) > 0.001 or self.left or self.right:
+            intervened = True
+
+
+        if self.gripper_enabled:
+            if self.left:  # close gripper
+                gripper_action = np.random.uniform(-1, -0.9, size=(1,))
+                intervened = True
+            elif self.right:  # open gripper
+                gripper_action = np.random.uniform(0.9, 1, size=(1,))
+                intervened = True
+            else:
+                gripper_action = np.zeros((1,))
+            expert_a = np.concatenate((expert_a, gripper_action), axis=0)
+            # expert_a[:6] += np.random.uniform(-0.5, 0.5, size=6)
+
+        if self.action_indices is not None:
+            filtered_expert_a = np.zeros_like(expert_a)
+            filtered_expert_a[self.action_indices] = expert_a[self.action_indices]
+            # filtered_expert_a = expert_a[self.action_indices]
+            expert_a = filtered_expert_a
+
+        if intervened:
+            return expert_a, True
+
+        return action, False
+
+    def step(self, action):
+        new_action, replaced = self.action(action)
+
+        
+        obs, rew, done, truncated, info = self.env.step(new_action)
+        if replaced:
+            info["intervene_action"] = new_action
+        info["left"] = self.left
+        info["right"] = self.right
+        return obs, rew, done, truncated, info
+
+    def close(self):
+        self.running = False
+        self.thread.join()
+        super().close()

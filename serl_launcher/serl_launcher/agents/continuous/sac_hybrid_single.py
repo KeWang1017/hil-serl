@@ -323,7 +323,7 @@ class SACAgentHybridSingleArm(flax.struct.PyTreeNode):
         rng, next_action_sample_key = jax.random.split(rng)
         next_actions, next_actions_log_probs = self._compute_next_actions(
             batch, next_action_sample_key
-        )
+        )                                                                     
 
         entropy = -next_actions_log_probs.mean()
         temperature_loss = self.temperature_lagrange_penalty(
@@ -422,13 +422,14 @@ class SACAgentHybridSingleArm(flax.struct.PyTreeNode):
         Sample actions from the policy network, **using an external RNG** (or approximating the argmax by the mode).
         The internal RNG will not be updated.
         """
-
+        # for ee actions you can choose either
         dist = self.forward_policy(observations, rng=seed, train=False)
         if argmax:
             ee_actions = dist.mode()
         else:
             ee_actions = dist.sample(seed=seed)
         
+        # for grasp actions you choose argmax
         seed, grasp_key = jax.random.split(seed, 2)
         grasp_q_values = self.forward_grasp_critic(observations, rng=grasp_key, train=False)
         
